@@ -13,7 +13,16 @@ from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError, sy
 
 from address_parser import parse_address
 from cache_db import get_cached_item, init_db, save_cached_item
-from config import HEADLESS, LOOKUP_DELAY_MAX, LOOKUP_DELAY_MIN, LOOKUP_ENABLED, OUTPUT_DIR
+from config import (
+    HEADLESS,
+    LOOKUP_DELAY_MAX,
+    LOOKUP_DELAY_MIN,
+    LOOKUP_ENABLED,
+    LOOKUP_PAGE_TIMEOUT_MS,
+    LOOKUP_RESULT_WAIT_SECONDS,
+    LOOKUP_SELECTOR_TIMEOUT_MS,
+    OUTPUT_DIR,
+)
 from address_converter import convert_to_jibun
 from sms_parser import FINAL_COLUMNS
 
@@ -103,6 +112,7 @@ def lookup_auction_items(
                 continue
 
             if page is None:
+                _emit_progress(progress_callback, completed, total, "브라우저 시작 중")
                 playwright = sync_playwright().start()
                 browser = _launch_chromium(playwright)
                 context = browser.new_context(
@@ -121,10 +131,12 @@ def lookup_auction_items(
                     else route.continue_(),
                 )
                 page = context.new_page()
+                page.set_default_timeout(LOOKUP_SELECTOR_TIMEOUT_MS)
+                page.set_default_navigation_timeout(LOOKUP_PAGE_TIMEOUT_MS)
 
             _emit_progress(progress_callback, completed, total, f"{case_no} 법원경매정보 조회 중")
             try:
-                result_map = _lookup_case(page, court, case_no)
+                result_map = _lookup_case(page, court, case_no, progress_callback, completed, total)
             except Exception as exc:
                 _write_debug_files_from_page(page, case_no, f"조회 실패: {exc}")
                 for index in pending_indexes:
@@ -169,57 +181,94 @@ def _launch_chromium(playwright):
     return playwright.chromium.launch(headless=HEADLESS)
 
 
-def _lookup_case(page: Page, court: str, case_no: str) -> dict[str, dict]:
+def _lookup_case(
+    page: Page,
+    court: str,
+    case_no: str,
+    progress_callback: ProgressCallback | None = None,
+    completed: int = 0,
+    total: int = 1,
+) -> dict[str, dict]:
     year, number = _split_case_no(case_no)
     court_name = _normalize_court(court)
 
-    page.goto(CASE_SEARCH_URL, wait_until="networkidle", timeout=60_000)
-    page.wait_for_selector(COURT_SELECT, timeout=30_000)
+    _emit_progress(progress_callback, completed, total, f"{case_no} 법원 사이트 접속 중")
+    page.goto(CASE_SEARCH_URL, wait_until="domcontentloaded", timeout=LOOKUP_PAGE_TIMEOUT_MS)
+    page.wait_for_selector(COURT_SELECT, timeout=LOOKUP_SELECTOR_TIMEOUT_MS)
+    _emit_progress(progress_callback, completed, total, f"{case_no} 검색 조건 입력 중")
     _select_option_by_text(page, COURT_SELECT, court_name)
     page.select_option(YEAR_SELECT, value=year)
     page.fill(CASE_NO_INPUT, number)
     _polite_delay()
 
-    body_text = _submit_search_and_wait(page, case_no)
+    _emit_progress(progress_callback, completed, total, f"{case_no} 검색 결과 대기 중")
+    body_text = _submit_search_and_wait(page, case_no, progress_callback, completed, total)
     items = _extract_items_from_case_page(page, body_text)
     if not items:
-        if "해당 사건번호는 잘못된 번호입니다" in body_text:
+        if case_no in body_text and _invalid_case_message(page, body_text):
             raise RuntimeError(f"{court_name} {case_no} 검색 결과 없음")
         raise RuntimeError(f"{court_name} {case_no} 물건별 주소 파싱 실패")
     return items
 
 
-def _submit_search_and_wait(page: Page, case_no: str) -> str:
-    last_text = ""
-    for attempt in range(2):
-        if attempt == 0:
-            page.click(SEARCH_BUTTON)
-        else:
-            page.locator(CASE_NO_INPUT).press("Enter")
-
-        last_text = _wait_for_result_text(page, case_no=case_no, timeout_seconds=45)
-        if _case_result_ready(page, last_text, case_no):
-            return last_text
+def _submit_search_and_wait(
+    page: Page,
+    case_no: str,
+    progress_callback: ProgressCallback | None = None,
+    completed: int = 0,
+    total: int = 1,
+) -> str:
+    page.click(SEARCH_BUTTON, timeout=LOOKUP_SELECTOR_TIMEOUT_MS)
+    last_text = _wait_for_result_text(
+        page,
+        case_no=case_no,
+        timeout_seconds=LOOKUP_RESULT_WAIT_SECONDS,
+        progress_callback=progress_callback,
+        completed=completed,
+        total=total,
+    )
     return last_text
 
 
-def _wait_for_result_text(page: Page, case_no: str, timeout_seconds: int) -> str:
+def _wait_for_result_text(
+    page: Page,
+    case_no: str,
+    timeout_seconds: int,
+    progress_callback: ProgressCallback | None = None,
+    completed: int = 0,
+    total: int = 1,
+) -> str:
     deadline = time.monotonic() + timeout_seconds
+    started = time.monotonic()
     last_text = ""
+    last_notice_second = -1
     while time.monotonic() < deadline:
+        remaining = max(0, int(deadline - time.monotonic()))
+        if remaining != last_notice_second and remaining % 5 == 0:
+            last_notice_second = remaining
+            _emit_progress(progress_callback, completed, total, f"{case_no} 결과 확인 중... 최대 {remaining}초")
         try:
-            page.wait_for_load_state("networkidle", timeout=3_000)
+            last_text = _clean_text(page.locator("body").inner_text(timeout=1_500))
         except PlaywrightTimeoutError:
-            pass
-        try:
-            last_text = _clean_text(page.locator("body").inner_text(timeout=5_000))
-        except PlaywrightTimeoutError:
-            page.wait_for_timeout(1_000)
+            page.wait_for_timeout(500)
             continue
         if _case_result_ready(page, last_text, case_no):
             return last_text
-        page.wait_for_timeout(1_000)
+        if time.monotonic() - started >= 2.5 and case_no in last_text and _invalid_case_message(page, last_text):
+            return last_text
+        page.wait_for_timeout(500)
     return last_text
+
+
+def _invalid_case_message(page: Page, body_text: str = "") -> bool:
+    try:
+        locator = page.locator("#mf_wfm_mainFrame_tbx_noCsNoMsg")
+        if not locator.is_visible(timeout=500):
+            return False
+        text = locator.inner_text(timeout=500)
+        return "잘못된 번호" in text
+    except Exception:
+        return False
 
 
 def _case_result_ready(page: Page, body_text: str, case_no: str) -> bool:
