@@ -51,6 +51,7 @@ def main() -> None:
         rows = parse_sms(original_text, default_court=DEFAULT_COURT, default_year=DEFAULT_YEAR)
         st.session_state["original_text"] = original_text
         st.session_state["rows"] = rows
+        st.session_state["lookup_identities"] = []
         st.session_state["looked_up"] = False
         st.session_state["editor_version"] = st.session_state.get("editor_version", 0) + 1
         st.session_state["lookup_message"] = ""
@@ -61,21 +62,38 @@ def main() -> None:
         return
 
     st.subheader("해석 결과")
+    st.caption("사건번호, 물건번호, 법원, 물건정보를 표에서 바로 고친 뒤 `수정사항 적용` 또는 `주소/호수 조회 실행`을 누르세요.")
     editor_key = f"result_editor_{st.session_state.get('editor_version', 0)}"
     edited_df = st.data_editor(
         pd.DataFrame(rows, columns=FINAL_COLUMNS),
         num_rows="dynamic",
         use_container_width=True,
         hide_index=True,
+        column_config=_editor_column_config(),
         key=editor_key,
     )
     edited_rows = _df_to_rows(edited_df)
-    st.session_state["rows"] = edited_rows
 
-    lookup_clicked = st.button("주소/호수 조회 실행", type="primary", use_container_width=True)
+    apply_col, lookup_col = st.columns([1, 3])
+    with apply_col:
+        apply_clicked = st.button("수정사항 적용", use_container_width=True)
+    with lookup_col:
+        lookup_clicked = st.button("주소/호수 조회 실행", type="primary", use_container_width=True)
     progress_area = st.container()
 
+    if apply_clicked:
+        applied_rows = _prepare_rows_after_edit(edited_rows)
+        st.session_state["rows"] = applied_rows
+        st.session_state["lookup_identities"] = [_row_identity(row) for row in applied_rows]
+        st.session_state["looked_up"] = False
+        st.session_state["lookup_message"] = "수정사항이 적용됐습니다. 이 표를 기준으로 조회합니다."
+        st.session_state["editor_version"] = st.session_state.get("editor_version", 0) + 1
+        st.success(st.session_state["lookup_message"])
+        st.rerun()
+
     if lookup_clicked:
+        edited_rows = _prepare_rows_after_edit(edited_rows)
+        st.session_state["rows"] = edited_rows
         with progress_area:
             progress_bar = st.progress(0, text="주소/호수 조회 준비 중")
             progress_text = st.empty()
@@ -92,6 +110,8 @@ def main() -> None:
                 lookup_enabled=actual_lookup,
             )
             st.session_state["rows"] = looked_up_rows
+            st.session_state["lookup_identities"] = [_row_identity(row) for row in looked_up_rows]
+            edited_rows = looked_up_rows
             st.session_state["looked_up"] = True
             st.session_state["lookup_message"] = f"주소/호수 조회 완료: {len(looked_up_rows)}건 처리"
             st.session_state["editor_version"] = st.session_state.get("editor_version", 0) + 1
@@ -100,7 +120,7 @@ def main() -> None:
     elif st.session_state.get("lookup_message"):
         progress_area.success(st.session_state["lookup_message"])
 
-    download_rows = st.session_state.get("rows", edited_rows)
+    download_rows = _prepare_rows_after_edit(edited_rows)
     excel_bytes = build_excel(download_rows, st.session_state.get("original_text", original_text))
     st.download_button(
         "엑셀 다운로드",
@@ -133,6 +153,44 @@ def _df_to_rows(dataframe: pd.DataFrame) -> list[dict]:
         {column: str(row.get(column, "")).strip() for column in FINAL_COLUMNS}
         for row in cleaned.to_dict(orient="records")
     ]
+
+
+def _editor_column_config() -> dict:
+    return {
+        "날짜": st.column_config.TextColumn("날짜", width="small"),
+        "법원": st.column_config.TextColumn("법원", help="예: 수원", width="small"),
+        "사건번호": st.column_config.TextColumn("사건번호", help="예: 2024타경3625", width="medium"),
+        "물건번호": st.column_config.TextColumn("물건번호", help="예: 1, 4, 11", width="small"),
+        "물건정보": st.column_config.TextColumn("물건정보", help="예: 빌라, 아파트, 오피", width="small"),
+        "비고": st.column_config.TextColumn("비고", width="large"),
+    }
+
+
+def _prepare_rows_after_edit(rows: list[dict]) -> list[dict]:
+    previous_identities = st.session_state.get("lookup_identities", [])
+    prepared_rows: list[dict] = []
+    for index, row in enumerate(rows):
+        prepared = {column: str(row.get(column, "")).strip() for column in FINAL_COLUMNS}
+        if index < len(previous_identities) and _row_identity(prepared) != tuple(previous_identities[index]):
+            _clear_lookup_result(prepared)
+        prepared_rows.append(prepared)
+    return prepared_rows
+
+
+def _row_identity(row: dict) -> tuple[str, str, str, str]:
+    return (
+        str(row.get("법원", "")).strip(),
+        str(row.get("사건번호", "")).strip(),
+        str(row.get("물건번호", "")).strip(),
+        str(row.get("물건정보", "")).strip(),
+    )
+
+
+def _clear_lookup_result(row: dict) -> None:
+    for column in ["지번주소", "도로명주소", "전체주소", "건물명", "건물동", "층", "호수"]:
+        row[column] = ""
+    row["조회상태"] = ""
+    row["확인필요사유"] = ""
 
 
 if __name__ == "__main__":
