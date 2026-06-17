@@ -1,0 +1,8 @@
+streamlit
+pandas
+openpyxl
+playwright
+python-dotenv
+beautifulsoup4
+lxml
+pytest
