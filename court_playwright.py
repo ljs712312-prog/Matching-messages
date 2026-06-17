@@ -21,6 +21,7 @@ from config import (
     LOOKUP_PAGE_TIMEOUT_MS,
     LOOKUP_RESULT_WAIT_SECONDS,
     LOOKUP_SELECTOR_TIMEOUT_MS,
+    LOOKUP_VILLA_RESULT_WAIT_SECONDS,
     OUTPUT_DIR,
 )
 from address_converter import convert_to_jibun
@@ -134,9 +135,26 @@ def lookup_auction_items(
                 page.set_default_timeout(LOOKUP_SELECTOR_TIMEOUT_MS)
                 page.set_default_navigation_timeout(LOOKUP_PAGE_TIMEOUT_MS)
 
-            _emit_progress(progress_callback, completed, total, f"{case_no} 법원경매정보 조회 중")
+            expected_item_numbers = [
+                _normalize_item_no(str(output_rows[index].get("물건번호", "")).strip())
+                for index in pending_indexes
+            ]
+            deep_lookup = any(_is_villa_like(output_rows[index]) for index in pending_indexes)
+            if deep_lookup:
+                _emit_progress(progress_callback, completed, total, f"{case_no} 빌라 주소 깊게 조회 중")
+            else:
+                _emit_progress(progress_callback, completed, total, f"{case_no} 법원경매정보 조회 중")
             try:
-                result_map = _lookup_case(page, court, case_no, progress_callback, completed, total)
+                result_map = _lookup_case(
+                    page,
+                    court,
+                    case_no,
+                    progress_callback,
+                    completed,
+                    total,
+                    expected_item_numbers=expected_item_numbers,
+                    deep_lookup=deep_lookup,
+                )
             except Exception as exc:
                 _write_debug_files_from_page(page, case_no, f"조회 실패: {exc}")
                 for index in pending_indexes:
@@ -148,12 +166,14 @@ def lookup_auction_items(
             for index in pending_indexes:
                 row = output_rows[index]
                 item_no = str(row.get("물건번호", "")).strip()
-                data = result_map.get(item_no)
+                data, fallback_reason = _select_item_data(result_map, item_no, row)
                 if not data:
                     _mark_failure(row, "조회실패", f"물건번호 매칭 실패 {case_no} {item_no}번 주소를 찾지 못함")
                 else:
                     _apply_address_data(row, data)
                     row["조회상태"] = "조회완료"
+                    if fallback_reason:
+                        _append_reason(row, fallback_reason)
                     save_cached_item(court, case_no, item_no, row)
                 completed += 1
                 _emit_progress(progress_callback, completed, total, f"{case_no} {item_no}번 처리 완료")
@@ -181,6 +201,35 @@ def _launch_chromium(playwright):
     return playwright.chromium.launch(headless=HEADLESS)
 
 
+def _is_villa_like(row: dict) -> bool:
+    text = " ".join(str(row.get(key, "") or "") for key in ("물건정보", "비고", "전체주소", "건물명"))
+    return any(keyword in text for keyword in ("빌라", "다세대", "연립", "다가구", "주택"))
+
+
+def _select_item_data(result_map: dict[str, dict], item_no: str, row: dict) -> tuple[dict | None, str]:
+    normalized_item_no = _normalize_item_no(item_no)
+    if normalized_item_no and normalized_item_no in result_map:
+        return result_map[normalized_item_no], ""
+    if item_no in result_map:
+        return result_map[item_no], ""
+    if not _is_villa_like(row) or not result_map:
+        return None, ""
+
+    ordered_keys = sorted(
+        result_map,
+        key=lambda value: int(value) if str(value).isdigit() else 10_000,
+    )
+    if len(ordered_keys) == 1:
+        return result_map[ordered_keys[0]], "빌라 주소 후보 단일 매칭"
+
+    if normalized_item_no.isdigit():
+        position = int(normalized_item_no) - 1
+        if 0 <= position < len(ordered_keys):
+            return result_map[ordered_keys[position]], f"빌라 물건번호 후보 매칭: {normalized_item_no}번째 주소 사용"
+
+    return None, ""
+
+
 def _lookup_case(
     page: Page,
     court: str,
@@ -188,6 +237,8 @@ def _lookup_case(
     progress_callback: ProgressCallback | None = None,
     completed: int = 0,
     total: int = 1,
+    expected_item_numbers: list[str] | None = None,
+    deep_lookup: bool = False,
 ) -> dict[str, dict]:
     year, number = _split_case_no(case_no)
     court_name = _normalize_court(court)
@@ -202,7 +253,15 @@ def _lookup_case(
     _polite_delay()
 
     _emit_progress(progress_callback, completed, total, f"{case_no} 검색 결과 대기 중")
-    body_text = _submit_search_and_wait(page, case_no, progress_callback, completed, total)
+    body_text = _submit_search_and_wait(
+        page,
+        case_no,
+        progress_callback,
+        completed,
+        total,
+        expected_item_numbers=expected_item_numbers,
+        deep_lookup=deep_lookup,
+    )
     items = _extract_items_from_case_page(page, body_text)
     if not items:
         if case_no in body_text and _invalid_case_message(page, body_text):
@@ -217,15 +276,20 @@ def _submit_search_and_wait(
     progress_callback: ProgressCallback | None = None,
     completed: int = 0,
     total: int = 1,
+    expected_item_numbers: list[str] | None = None,
+    deep_lookup: bool = False,
 ) -> str:
     page.click(SEARCH_BUTTON, timeout=LOOKUP_SELECTOR_TIMEOUT_MS)
+    wait_seconds = LOOKUP_VILLA_RESULT_WAIT_SECONDS if deep_lookup else LOOKUP_RESULT_WAIT_SECONDS
     last_text = _wait_for_result_text(
         page,
         case_no=case_no,
-        timeout_seconds=LOOKUP_RESULT_WAIT_SECONDS,
+        timeout_seconds=wait_seconds,
         progress_callback=progress_callback,
         completed=completed,
         total=total,
+        expected_item_numbers=expected_item_numbers,
+        deep_lookup=deep_lookup,
     )
     return last_text
 
@@ -237,6 +301,8 @@ def _wait_for_result_text(
     progress_callback: ProgressCallback | None = None,
     completed: int = 0,
     total: int = 1,
+    expected_item_numbers: list[str] | None = None,
+    deep_lookup: bool = False,
 ) -> str:
     deadline = time.monotonic() + timeout_seconds
     started = time.monotonic()
@@ -253,11 +319,25 @@ def _wait_for_result_text(
             page.wait_for_timeout(500)
             continue
         if _case_result_ready(page, last_text, case_no):
+            if deep_lookup and expected_item_numbers:
+                items = _extract_items_from_case_page(page, last_text)
+                if _has_expected_items(items, expected_item_numbers):
+                    return last_text
+                page.wait_for_timeout(700)
+                continue
             return last_text
         if time.monotonic() - started >= 2.5 and case_no in last_text and _invalid_case_message(page, last_text):
             return last_text
         page.wait_for_timeout(500)
     return last_text
+
+
+def _has_expected_items(items: dict[str, dict], expected_item_numbers: list[str]) -> bool:
+    available = {str(key).strip() for key in items if str(key).strip()}
+    expected = {str(value).strip() for value in expected_item_numbers if str(value).strip()}
+    if not expected:
+        return bool(available)
+    return bool(available & expected)
 
 
 def _invalid_case_message(page: Page, body_text: str = "") -> bool:
@@ -287,6 +367,8 @@ def _case_result_ready(page: Page, body_text: str, case_no: str) -> bool:
 
 def _extract_items_from_case_page(page: Page, body_text: str) -> dict[str, dict]:
     items = _extract_items_from_case_text(body_text)
+    for item_no, data in _extract_distribution_items_from_text(body_text).items():
+        items.setdefault(item_no, data)
     for item_no, data in _extract_distribution_items_from_page(page).items():
         items.setdefault(item_no, data)
     return items
@@ -313,9 +395,15 @@ def _extract_distribution_items_from_page(page: Page) -> dict[str, dict]:
         "mf_wfm_mainFrame_grd_dstrtDemnDts",
         ["column1", "column3", "column4"],
     )
-    if not rows:
-        rows = _dom_grid_rows(page, "mf_wfm_mainFrame_grd_dstrtDemnDts")
+    result = _distribution_items_from_rows(rows)
+    if result:
+        return result
 
+    rows = _dom_grid_rows(page, "mf_wfm_mainFrame_grd_dstrtDemnDts")
+    return _distribution_items_from_rows(rows)
+
+
+def _distribution_items_from_rows(rows: list[dict[str, str]]) -> dict[str, dict]:
     result: dict[str, dict] = {}
     for row in rows:
         item_no = _normalize_item_no(row.get("column1") or row.get("0") or "")
@@ -323,6 +411,20 @@ def _extract_distribution_items_from_page(page: Page) -> dict[str, dict]:
         if not item_no or not _looks_like_address(address):
             continue
         result[item_no] = _build_address_data(address)
+    return result
+
+
+def _extract_distribution_items_from_text(body_text: str) -> dict[str, dict]:
+    text = _clean_text(body_text)
+    result: dict[str, dict] = {}
+    pattern = re.compile(
+        r"(?:^|\s)(\d{1,4})\s+((?:[가-힣]+(?:특별시|광역시|도|시|군|구)\s*){1,4}.+?)\s+\d{4}\.\d{2}\.\d{2}(?:\s|$)"
+    )
+    for match in pattern.finditer(text):
+        item_no = _normalize_item_no(match.group(1))
+        address = _clean_address(match.group(2))
+        if item_no and _looks_like_address(address):
+            result[item_no] = _build_address_data(address)
     return result
 
 
@@ -556,6 +658,9 @@ def _parse_address_compatible(full_address: str, road_address: str = "") -> dict
         if m:
             parsed["지번주소"] = m.group(0).strip()
 
+    if not parsed.get("도로명주소") and _looks_like_road_address(full_address):
+        parsed["도로명주소"] = _strip_detail_from_road_address(full_address)
+
     # 건물동 예비 추출: 101동 / 제101동 / A동 / 비동
     if not parsed.get("건물동"):
         m = re.search(r"(?:제\s*)?(\d{1,4}동|[A-Za-z가-힣]{1,5}동)", full_address)
@@ -578,6 +683,16 @@ def _parse_address_compatible(full_address: str, road_address: str = "") -> dict
             parsed["호수"] = f"{m.group(1)}호"
 
     return parsed
+
+
+def _looks_like_road_address(value: str) -> bool:
+    return bool(re.search(r"[가-힣0-9]+(?:로|길)\s*\d+(?:-\d+)?", str(value or "")))
+
+
+def _strip_detail_from_road_address(value: str) -> str:
+    text = _clean_address(value)
+    match = re.search(r"^(.+?[가-힣0-9]+(?:로|길)\s*\d+(?:-\d+)?)", text)
+    return match.group(1).strip(" ,") if match else text
 
 
 def _fill_from_existing_address(row: dict) -> None:
