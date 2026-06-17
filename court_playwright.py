@@ -19,8 +19,10 @@ from config import (
     LOOKUP_DELAY_MIN,
     LOOKUP_ENABLED,
     LOOKUP_PAGE_TIMEOUT_MS,
+    LOOKUP_READY_RETURN_SECONDS,
     LOOKUP_RESULT_WAIT_SECONDS,
     LOOKUP_SELECTOR_TIMEOUT_MS,
+    LOOKUP_VILLA_CANDIDATE_WAIT_SECONDS,
     LOOKUP_VILLA_RESULT_WAIT_SECONDS,
     OUTPUT_DIR,
 )
@@ -243,9 +245,7 @@ def _lookup_case(
     year, number = _split_case_no(case_no)
     court_name = _normalize_court(court)
 
-    _emit_progress(progress_callback, completed, total, f"{case_no} 법원 사이트 접속 중")
-    page.goto(CASE_SEARCH_URL, wait_until="domcontentloaded", timeout=LOOKUP_PAGE_TIMEOUT_MS)
-    page.wait_for_selector(COURT_SELECT, timeout=LOOKUP_SELECTOR_TIMEOUT_MS)
+    _ensure_search_form(page, case_no, progress_callback, completed, total)
     _emit_progress(progress_callback, completed, total, f"{case_no} 검색 조건 입력 중")
     _select_option_by_text(page, COURT_SELECT, court_name)
     page.select_option(YEAR_SELECT, value=year)
@@ -268,6 +268,24 @@ def _lookup_case(
             raise RuntimeError(f"{court_name} {case_no} 검색 결과 없음")
         raise RuntimeError(f"{court_name} {case_no} 물건별 주소 파싱 실패")
     return items
+
+
+def _ensure_search_form(
+    page: Page,
+    case_no: str,
+    progress_callback: ProgressCallback | None = None,
+    completed: int = 0,
+    total: int = 1,
+) -> None:
+    try:
+        if page.locator(COURT_SELECT).is_visible(timeout=500):
+            return
+    except Exception:
+        pass
+
+    _emit_progress(progress_callback, completed, total, f"{case_no} 법원 사이트 접속 중")
+    page.goto(CASE_SEARCH_URL, wait_until="domcontentloaded", timeout=LOOKUP_PAGE_TIMEOUT_MS)
+    page.wait_for_selector(COURT_SELECT, timeout=LOOKUP_SELECTOR_TIMEOUT_MS)
 
 
 def _submit_search_and_wait(
@@ -314,21 +332,28 @@ def _wait_for_result_text(
             last_notice_second = remaining
             _emit_progress(progress_callback, completed, total, f"{case_no} 결과 확인 중... 최대 {remaining}초")
         try:
-            last_text = _clean_text(page.locator("body").inner_text(timeout=1_500))
+            last_text = _clean_text(page.locator("body").inner_text(timeout=800))
         except PlaywrightTimeoutError:
-            page.wait_for_timeout(500)
+            page.wait_for_timeout(300)
             continue
         if _case_result_ready(page, last_text, case_no):
             if deep_lookup and expected_item_numbers:
                 items = _extract_items_from_case_page(page, last_text)
                 if _has_expected_items(items, expected_item_numbers):
                     return last_text
-                page.wait_for_timeout(700)
+                elapsed = time.monotonic() - started
+                if items and elapsed >= LOOKUP_VILLA_CANDIDATE_WAIT_SECONDS:
+                    _emit_progress(progress_callback, completed, total, f"{case_no} 주소 후보 확인 후 처리 중")
+                    return last_text
+                if not items and elapsed >= LOOKUP_READY_RETURN_SECONDS:
+                    _emit_progress(progress_callback, completed, total, f"{case_no} 검색 결과 표시 확인 후 처리 중")
+                    return last_text
+                page.wait_for_timeout(400)
                 continue
             return last_text
         if time.monotonic() - started >= 2.5 and case_no in last_text and _invalid_case_message(page, last_text):
             return last_text
-        page.wait_for_timeout(500)
+        page.wait_for_timeout(300)
     return last_text
 
 
