@@ -165,6 +165,11 @@ def lookup_auction_items(
                     _emit_progress(progress_callback, completed, total, f"{case_no} 조회 실패")
                 continue
 
+            # A case page often contains every item. Cache all of them now so a
+            # later lookup for another item in the same case does not reopen the site.
+            for result_item_no, result_data in result_map.items():
+                save_cached_item(court, case_no, result_item_no, result_data)
+
             for index in pending_indexes:
                 row = output_rows[index]
                 item_no = str(row.get("물건번호", "")).strip()
@@ -337,13 +342,14 @@ def _wait_for_result_text(
             page.wait_for_timeout(300)
             continue
         if _case_result_ready(page, last_text, case_no):
-            if deep_lookup and expected_item_numbers:
+            if expected_item_numbers:
                 items = _extract_items_from_case_page(page, last_text)
                 if _has_expected_items(items, expected_item_numbers):
                     return last_text
                 elapsed = time.monotonic() - started
-                if items and elapsed >= LOOKUP_VILLA_CANDIDATE_WAIT_SECONDS:
-                    _emit_progress(progress_callback, completed, total, f"{case_no} 주소 후보 확인 후 처리 중")
+                candidate_wait = LOOKUP_VILLA_CANDIDATE_WAIT_SECONDS if deep_lookup else 2.5
+                if items and elapsed >= candidate_wait:
+                    _emit_progress(progress_callback, completed, total, f"{case_no} 확인된 주소 먼저 처리 중")
                     return last_text
                 if not items and elapsed >= LOOKUP_READY_RETURN_SECONDS:
                     _emit_progress(progress_callback, completed, total, f"{case_no} 검색 결과 표시 확인 후 처리 중")
@@ -362,7 +368,7 @@ def _has_expected_items(items: dict[str, dict], expected_item_numbers: list[str]
     expected = {str(value).strip() for value in expected_item_numbers if str(value).strip()}
     if not expected:
         return bool(available)
-    return bool(available & expected)
+    return expected.issubset(available)
 
 
 def _invalid_case_message(page: Page, body_text: str = "") -> bool:

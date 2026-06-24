@@ -3,6 +3,7 @@ from court_playwright import (
     _extract_items_from_case_text,
     _normalize_court,
     lookup_auction_items,
+    _has_expected_items,
 )
 from sms_parser import FINAL_COLUMNS
 
@@ -39,6 +40,13 @@ def test_dirty_court_name_is_normalized_for_court_site():
     assert _normalize_court("번수원") == "수원지방법원"
     assert _normalize_court("찾고있슴수원") == "수원지방법원"
     assert _normalize_court("수원") == "수원지방법원"
+
+
+def test_result_wait_requires_all_requested_items():
+    items = {"1": {"전체주소": "주소1"}, "2": {"전체주소": "주소2"}}
+
+    assert _has_expected_items(items, ["1", "2"])
+    assert not _has_expected_items(items, ["1", "2", "3"])
 
 
 def test_lookup_normalizes_dirty_court_before_cache_lookup(monkeypatch):
