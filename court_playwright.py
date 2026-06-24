@@ -8,6 +8,8 @@ import shutil
 import time
 from collections import defaultdict
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
+from queue import Empty, Queue
 
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
@@ -24,6 +26,7 @@ from config import (
     LOOKUP_SELECTOR_TIMEOUT_MS,
     LOOKUP_VILLA_CANDIDATE_WAIT_SECONDS,
     LOOKUP_VILLA_RESULT_WAIT_SECONDS,
+    LOOKUP_WORKERS,
     OUTPUT_DIR,
 )
 from address_converter import convert_to_jibun
@@ -44,6 +47,95 @@ _ONE_PIXEL_PNG = base64.b64decode(
 
 
 def lookup_auction_items(
+    rows: list[dict],
+    progress_callback: ProgressCallback | None = None,
+    lookup_enabled: bool | None = None,
+) -> list[dict]:
+    enabled = LOOKUP_ENABLED if lookup_enabled is None else lookup_enabled
+    case_groups = _group_row_indexes_by_case(rows)
+    worker_count = min(LOOKUP_WORKERS, len(case_groups))
+    if not enabled or worker_count < 2:
+        return _lookup_auction_items_sequential(rows, progress_callback, enabled)
+    return _lookup_auction_items_parallel(rows, progress_callback, enabled, case_groups, worker_count)
+
+
+def _lookup_auction_items_parallel(
+    rows: list[dict],
+    progress_callback: ProgressCallback | None,
+    enabled: bool,
+    case_groups: list[list[int]],
+    worker_count: int,
+) -> list[dict]:
+    init_db()
+    chunks: list[list[int]] = [[] for _ in range(worker_count)]
+    for group_index, indexes in enumerate(case_groups):
+        chunks[group_index % worker_count].extend(indexes)
+
+    messages: Queue[tuple[int, int, str]] = Queue()
+    worker_progress = [0] * worker_count
+    total = max(len(rows), 1)
+    _emit_progress(progress_callback, 0, total, f"법원 조회 {worker_count}개 동시 실행 준비 중")
+
+    def run_chunk(worker_id: int, indexes: list[int]) -> list[tuple[int, dict]]:
+        chunk_rows = [rows[index] for index in indexes]
+
+        def report(done: int, _total: int, message: str) -> None:
+            messages.put((worker_id, done, message))
+
+        results = _lookup_auction_items_sequential(chunk_rows, report, enabled)
+        return list(zip(indexes, results))
+
+    futures: list[tuple[Future, list[int]]] = []
+    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="court-lookup") as executor:
+        for worker_id, indexes in enumerate(chunks):
+            futures.append((executor.submit(run_chunk, worker_id, indexes), indexes))
+
+        while any(not future.done() for future, _ in futures):
+            try:
+                worker_id, done, message = messages.get(timeout=0.15)
+            except Empty:
+                continue
+            worker_progress[worker_id] = done
+            _emit_progress(progress_callback, sum(worker_progress), total, message)
+
+    while True:
+        try:
+            worker_id, done, message = messages.get_nowait()
+        except Empty:
+            break
+        worker_progress[worker_id] = done
+        _emit_progress(progress_callback, sum(worker_progress), total, message)
+
+    output: list[dict | None] = [None] * len(rows)
+    for future, indexes in futures:
+        try:
+            indexed_results = future.result()
+        except Exception:
+            fallback_rows = _lookup_auction_items_sequential(
+                [rows[index] for index in indexes],
+                progress_callback=None,
+                lookup_enabled=enabled,
+            )
+            indexed_results = list(zip(indexes, fallback_rows))
+        for index, result in indexed_results:
+            output[index] = result
+
+    _emit_progress(progress_callback, total, total, "주소/호수 조회 완료")
+    return [result if result is not None else dict(rows[index]) for index, result in enumerate(output)]
+
+
+def _group_row_indexes_by_case(rows: list[dict]) -> list[list[int]]:
+    grouped: dict[tuple[str, str], list[int]] = {}
+    for index, row in enumerate(rows):
+        key = (
+            _normalize_court_label(str(row.get("법원", "")).strip()),
+            str(row.get("사건번호", "")).strip(),
+        )
+        grouped.setdefault(key, []).append(index)
+    return list(grouped.values())
+
+
+def _lookup_auction_items_sequential(
     rows: list[dict],
     progress_callback: ProgressCallback | None = None,
     lookup_enabled: bool | None = None,

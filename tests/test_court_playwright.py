@@ -4,6 +4,7 @@ from court_playwright import (
     _normalize_court,
     lookup_auction_items,
     _has_expected_items,
+    _lookup_auction_items_parallel,
 )
 from sms_parser import FINAL_COLUMNS
 
@@ -47,6 +48,40 @@ def test_result_wait_requires_all_requested_items():
 
     assert _has_expected_items(items, ["1", "2"])
     assert not _has_expected_items(items, ["1", "2", "3"])
+
+
+def test_parallel_lookup_preserves_original_row_order(monkeypatch):
+    monkeypatch.setattr("court_playwright.init_db", lambda: None)
+
+    def fake_sequential(rows, progress_callback=None, lookup_enabled=None):
+        output = []
+        for done, row in enumerate(rows, start=1):
+            result = dict(row)
+            result["조회상태"] = f"완료-{row['사건번호']}"
+            output.append(result)
+            if progress_callback:
+                progress_callback(done, len(rows), result["조회상태"])
+        return output
+
+    monkeypatch.setattr("court_playwright._lookup_auction_items_sequential", fake_sequential)
+    rows = [
+        _row(사건번호="2025타경3"),
+        _row(사건번호="2025타경1"),
+        _row(사건번호="2025타경2"),
+    ]
+    progress = []
+
+    output = _lookup_auction_items_parallel(
+        rows,
+        lambda done, total, message: progress.append((done, total, message)),
+        True,
+        [[0], [1], [2]],
+        2,
+    )
+
+    assert [row["사건번호"] for row in output] == ["2025타경3", "2025타경1", "2025타경2"]
+    assert all(row["조회상태"].startswith("완료-") for row in output)
+    assert progress[-1] == (3, 3, "주소/호수 조회 완료")
 
 
 def test_lookup_normalizes_dirty_court_before_cache_lookup(monkeypatch):
