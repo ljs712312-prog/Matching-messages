@@ -44,6 +44,8 @@ SEARCH_BUTTON = "#mf_wfm_mainFrame_btn_auctnCsSrchBtn"
 _ONE_PIXEL_PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
 )
+_MAX_CAPTURED_RESPONSE_CHARS = 1_200_000
+_MAX_SINGLE_RESPONSE_CHARS = 250_000
 
 
 def lookup_auction_items(
@@ -226,6 +228,7 @@ def _lookup_auction_items_sequential(
                     else route.continue_(),
                 )
                 page = context.new_page()
+                _attach_response_collector(page)
                 page.set_default_timeout(LOOKUP_SELECTOR_TIMEOUT_MS)
                 page.set_default_navigation_timeout(LOOKUP_PAGE_TIMEOUT_MS)
 
@@ -239,7 +242,7 @@ def _lookup_auction_items_sequential(
             else:
                 _emit_progress(progress_callback, completed, total, f"{case_no} 법원경매정보 조회 중")
             try:
-                result_map = _lookup_case(
+                result_map = _lookup_case_with_retries(
                     page,
                     court,
                     case_no,
@@ -252,7 +255,7 @@ def _lookup_auction_items_sequential(
             except Exception as exc:
                 _write_debug_files_from_page(page, case_no, f"조회 실패: {exc}")
                 for index in pending_indexes:
-                    _mark_failure(output_rows[index], "조회실패", str(exc))
+                    _mark_failure(output_rows[index], "조회실패", _classify_lookup_exception(exc))
                     completed += 1
                     _emit_progress(progress_callback, completed, total, f"{case_no} 조회 실패")
                 continue
@@ -267,6 +270,8 @@ def _lookup_auction_items_sequential(
                 item_no = str(row.get("물건번호", "")).strip()
                 data, fallback_reason = _select_item_data(result_map, item_no, row)
                 if not data:
+                    if page is not None:
+                        _write_debug_files_from_page(page, case_no, f"물건번호 매칭 실패: {case_no} {item_no}번", item_no)
                     _mark_failure(row, "조회실패", f"물건번호 매칭 실패 {case_no} {item_no}번 주소를 찾지 못함")
                 else:
                     _apply_address_data(row, data)
@@ -300,6 +305,44 @@ def _launch_chromium(playwright):
     return playwright.chromium.launch(headless=HEADLESS)
 
 
+def _attach_response_collector(page: Page) -> None:
+    if hasattr(page, "_auction_response_texts"):
+        return
+    setattr(page, "_auction_response_texts", [])
+
+    def capture_response(response) -> None:
+        try:
+            content_type = (response.headers.get("content-type") or "").lower()
+            url = response.url.lower()
+            if not any(token in content_type for token in ("text", "html", "xml", "json", "javascript")) and not any(
+                token in url for token in ("wq", "w2x", "pgj", "auction", "json", "xml")
+            ):
+                return
+            text = response.text()
+        except Exception:
+            return
+        if not text:
+            return
+        text = text[:_MAX_SINGLE_RESPONSE_CHARS]
+        captured = getattr(page, "_auction_response_texts", [])
+        current_size = sum(len(value) for value in captured)
+        if current_size < _MAX_CAPTURED_RESPONSE_CHARS:
+            captured.append(f"\n\n--- RESPONSE {response.status} {response.url} ---\n{text}")
+
+    page.on("response", capture_response)
+
+
+def _reset_response_collector(page: Page) -> None:
+    setattr(page, "_auction_response_texts", [])
+
+
+def _captured_response_text(page: Page) -> str:
+    captured = getattr(page, "_auction_response_texts", [])
+    if not isinstance(captured, list):
+        return ""
+    return "\n".join(str(value) for value in captured)[-_MAX_CAPTURED_RESPONSE_CHARS:]
+
+
 def _is_villa_like(row: dict) -> bool:
     text = " ".join(str(row.get(key, "") or "") for key in ("물건정보", "비고", "전체주소", "건물명"))
     return any(keyword in text for keyword in ("빌라", "다세대", "연립", "다가구", "주택"))
@@ -329,6 +372,50 @@ def _select_item_data(result_map: dict[str, dict], item_no: str, row: dict) -> t
     return None, ""
 
 
+def _lookup_case_with_retries(
+    page: Page,
+    court: str,
+    case_no: str,
+    progress_callback: ProgressCallback | None = None,
+    completed: int = 0,
+    total: int = 1,
+    expected_item_numbers: list[str] | None = None,
+    deep_lookup: bool = False,
+) -> dict[str, dict]:
+    last_error: Exception | None = None
+    for attempt in range(1, 4):
+        if attempt == 2:
+            _emit_progress(progress_callback, completed, total, f"{case_no} 2차 재조회 중")
+        elif attempt == 3:
+            _emit_progress(progress_callback, completed, total, f"{case_no} 새로고침 후 최종 재조회 중")
+            try:
+                page.goto(CASE_SEARCH_URL, wait_until="domcontentloaded", timeout=LOOKUP_PAGE_TIMEOUT_MS)
+            except Exception:
+                pass
+        try:
+            return _lookup_case(
+                page,
+                court,
+                case_no,
+                progress_callback,
+                completed,
+                total,
+                expected_item_numbers=expected_item_numbers,
+                deep_lookup=deep_lookup,
+            )
+        except RuntimeError as exc:
+            last_error = exc
+            if "검색 결과 없음" in str(exc):
+                break
+            page.wait_for_timeout(700)
+        except Exception as exc:
+            last_error = exc
+            page.wait_for_timeout(700)
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"{case_no} 조회 실패")
+
+
 def _lookup_case(
     page: Page,
     court: str,
@@ -350,6 +437,7 @@ def _lookup_case(
     _polite_delay()
 
     _emit_progress(progress_callback, completed, total, f"{case_no} 검색 결과 대기 중")
+    _reset_response_collector(page)
     body_text = _submit_search_and_wait(
         page,
         case_no,
@@ -359,7 +447,9 @@ def _lookup_case(
         expected_item_numbers=expected_item_numbers,
         deep_lookup=deep_lookup,
     )
-    items = _extract_items_from_case_page(page, body_text)
+    network_text = _captured_response_text(page)
+    combined_text = "\n".join(value for value in (body_text, network_text) if value)
+    items = _extract_items_from_case_page(page, combined_text)
     if not items:
         if case_no in body_text and _invalid_case_message(page, body_text):
             raise RuntimeError(f"{court_name} {case_no} 검색 결과 없음")
@@ -494,6 +584,8 @@ def _extract_items_from_case_page(page: Page, body_text: str) -> dict[str, dict]
         items.setdefault(item_no, data)
     for item_no, data in _extract_distribution_items_from_page(page).items():
         items.setdefault(item_no, data)
+    for item_no, data in _extract_dynamic_grid_items_from_page(page).items():
+        items.setdefault(item_no, data)
     return items
 
 
@@ -535,6 +627,100 @@ def _distribution_items_from_rows(rows: list[dict[str, str]]) -> dict[str, dict]
             continue
         result[item_no] = _build_address_data(address)
     return result
+
+
+def _extract_dynamic_grid_items_from_page(page: Page) -> dict[str, dict]:
+    rows = _dynamic_websquare_grid_rows(page)
+    result: dict[str, dict] = {}
+    for row in rows:
+        values = [_clean_text(str(value)) for key, value in row.items() if key != "__grid_id" and str(value or "").strip()]
+        if not values:
+            continue
+        item_no = _guess_item_no(values)
+        address = _first_valid_address(values)
+        road_address = next((value for value in values if _looks_like_road_address(value)), "")
+        if item_no and address:
+            result.setdefault(item_no, _build_address_data(address, road_address))
+    return result
+
+
+def _guess_item_no(values: list[str]) -> str:
+    for value in values[:5]:
+        normalized = _normalize_item_no(value)
+        if normalized and len(normalized) <= 4:
+            return normalized
+    return ""
+
+
+def _dynamic_websquare_grid_rows(page: Page) -> list[dict[str, str]]:
+    try:
+        rows = page.evaluate(
+            """
+            () => {
+                const rowCountMethods = ["getRowCount", "getTotalRow", "getDataLength", "getRealRowCount"];
+                const cellMethods = ["getCellData", "getCellDisplayValue", "getCellValue"];
+                const columnMethods = ["getColumnIDList", "getColumnIds", "getColumnIdList"];
+
+                const call = (obj, method, args = []) => {
+                    try {
+                        if (obj && typeof obj[method] === "function") {
+                            const value = obj[method](...args);
+                            return value == null ? "" : value;
+                        }
+                    } catch (error) {}
+                    return "";
+                };
+
+                const getCount = (obj) => {
+                    for (const method of rowCountMethods) {
+                        const value = Number(call(obj, method));
+                        if (Number.isFinite(value) && value > 0 && value < 500) return value;
+                    }
+                    return 0;
+                };
+
+                const getColumns = (obj) => {
+                    for (const method of columnMethods) {
+                        const value = call(obj, method);
+                        if (Array.isArray(value) && value.length) return value.map(String);
+                        if (typeof value === "string" && value.trim()) {
+                            return value.split(/[,\\s]+/).filter(Boolean);
+                        }
+                    }
+                    return Array.from({ length: 40 }, (_, index) => String(index));
+                };
+
+                const output = [];
+                const seen = new Set();
+                for (const [id, obj] of Object.entries(window)) {
+                    if (!obj || typeof obj !== "object" || seen.has(obj)) continue;
+                    seen.add(obj);
+                    const rowCount = getCount(obj);
+                    if (!rowCount) continue;
+                    const columns = getColumns(obj);
+                    for (let rowIndex = 0; rowIndex < rowCount; rowIndex += 1) {
+                        const row = { __grid_id: id };
+                        for (const columnId of columns) {
+                            let value = "";
+                            for (const method of cellMethods) {
+                                value = call(obj, method, [rowIndex, columnId]);
+                                if (String(value || "").trim()) break;
+                            }
+                            if (String(value || "").trim()) row[columnId] = String(value).trim();
+                        }
+                        if (Object.keys(row).length > 1) output.push(row);
+                    }
+                }
+                return output;
+            }
+            """
+        )
+    except Exception:
+        return []
+
+    if not isinstance(rows, list):
+        return []
+    return [{str(key): str(value or "") for key, value in row.items()} for row in rows if isinstance(row, dict)]
 
 
 def _extract_distribution_items_from_text(body_text: str) -> dict[str, dict]:
@@ -940,6 +1126,23 @@ def _clean_address(value: str) -> str:
     return value.strip(" \n\t,")
 
 
+def _classify_lookup_exception(exc: Exception) -> str:
+    message = str(exc)
+    if isinstance(exc, PlaywrightTimeoutError) or "Timeout" in message or "timeout" in message:
+        return f"RESULT_WAIT_TIMEOUT {message}"
+    if "검색 결과 없음" in message:
+        return f"NO_SEARCH_RESULT {message}"
+    if "물건별 주소 파싱 실패" in message:
+        return f"PARSE_FAILED {message}"
+    if "법원 선택값" in message:
+        return f"COURT_SELECT_FAILED {message}"
+    if "사건번호 형식" in message:
+        return f"CASE_NO_FORMAT_FAILED {message}"
+    if "net::" in message or "ERR_" in message:
+        return f"NETWORK_FAILED {message}"
+    return f"LOOKUP_FAILED {message}"
+
+
 def _mark_failure(row: dict, status: str, reason: str) -> None:
     row["조회상태"] = status
     if status == "조회실패" and "법원경매 조회 실패" not in reason and "물건번호 매칭 실패" not in reason:
@@ -962,17 +1165,43 @@ def _polite_delay() -> None:
     time.sleep(random.uniform(LOOKUP_DELAY_MIN, LOOKUP_DELAY_MAX))
 
 
-def _write_debug_files_from_page(page: Page, case_no: str, message: str) -> None:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+def _write_debug_files_from_page(page: Page, case_no: str, message: str, item_no: str = "") -> None:
+    debug_dir = OUTPUT_DIR / "debug"
+    debug_dir.mkdir(parents=True, exist_ok=True)
     safe_case_no = re.sub(r"[^0-9A-Za-z가-힣_-]+", "_", case_no)
-    html_path = OUTPUT_DIR / f"debug_{safe_case_no}.html"
-    png_path = OUTPUT_DIR / f"debug_{safe_case_no}.png"
+    safe_item_no = re.sub(r"[^0-9A-Za-z가-힣_-]+", "_", str(item_no or "case"))
+    prefix = debug_dir / f"{safe_case_no}_{safe_item_no}"
+    html_path = prefix.with_name(f"{prefix.name}_page.html")
+    png_path = prefix.with_name(f"{prefix.name}_screenshot.png")
+    body_path = prefix.with_name(f"{prefix.name}_body.txt")
+    grid_path = prefix.with_name(f"{prefix.name}_grid.txt")
+    network_path = prefix.with_name(f"{prefix.name}_network.txt")
     try:
         content = page.content()
     except Exception:
         content = f"<html><body>{html.escape(message)}</body></html>"
     html_path.write_text(content, encoding="utf-8")
     try:
+        body_text = page.locator("body").inner_text(timeout=1000)
+    except Exception:
+        body_text = ""
+    body_path.write_text(f"{message}\n\n{body_text}", encoding="utf-8")
+    grid_path.write_text(_debug_grid_text(page), encoding="utf-8")
+    network_path.write_text(_captured_response_text(page), encoding="utf-8")
+    try:
         page.screenshot(path=str(png_path), full_page=True)
     except (PlaywrightTimeoutError, Exception):
         png_path.write_bytes(_ONE_PIXEL_PNG)
+
+
+def _debug_grid_text(page: Page) -> str:
+    rows = _dynamic_websquare_grid_rows(page)
+    if not rows:
+        return ""
+    lines: list[str] = []
+    for row in rows:
+        grid_id = row.get("__grid_id", "")
+        values = [f"{key}={value}" for key, value in row.items() if key != "__grid_id" and str(value).strip()]
+        if values:
+            lines.append(f"[{grid_id}] " + " | ".join(values))
+    return "\n".join(lines)
